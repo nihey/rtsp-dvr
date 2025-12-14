@@ -15,36 +15,26 @@ const IMOU_API_BASE = 'https://openapi.easy4ip.com';
 
 /**
  * Generate IMOU API signature
+ * Format: MD5("time:{time},nonce:{nonce},appSecret:{appSecret}")
  */
-function generateSign(params, appSecret) {
-  const sortedKeys = Object.keys(params).sort();
-  let signStr = '';
-  for (const key of sortedKeys) {
-    if (params[key] !== undefined && params[key] !== null && params[key] !== '') {
-      signStr += `${key}:${params[key]},`;
-    }
-  }
-  signStr = signStr.slice(0, -1); // Remove trailing comma
-  const hmac = crypto.createHmac('md5', appSecret);
-  hmac.update(signStr);
-  return hmac.digest('hex').toUpperCase();
+function generateSign(time, nonce, appSecret) {
+  const signStr = `time:${time},nonce:${nonce},appSecret:${appSecret}`;
+  return crypto.createHash('md5').update(signStr).digest('hex');
 }
 
 /**
  * Get access token from IMOU API
  */
 async function getAccessToken(appId, appSecret) {
-  const params = {
-    time: Math.floor(Date.now() / 1000),
-    appId,
-    id: crypto.randomUUID(),
-  };
-
-  const sign = generateSign(params, appSecret);
+  const time = Math.floor(Date.now() / 1000);
+  const nonce = crypto.randomUUID();
+  const sign = generateSign(time, nonce, appSecret);
 
   const response = await axios.post(`${IMOU_API_BASE}/openapi/accessToken`, {
     system: {
-      ...params,
+      time,
+      nonce,
+      appId,
       sign,
       ver: '1.0',
     },
@@ -61,18 +51,16 @@ async function getAccessToken(appId, appSecret) {
  * Get device list from IMOU API
  */
 async function getDeviceList(appId, appSecret, accessToken) {
-  const params = {
-    time: Math.floor(Date.now() / 1000),
-    appId,
-    id: crypto.randomUUID(),
-    accessToken,
-  };
-
-  const sign = generateSign(params, appSecret);
+  const time = Math.floor(Date.now() / 1000);
+  const nonce = crypto.randomUUID();
+  const sign = generateSign(time, nonce, appSecret);
 
   const response = await axios.post(`${IMOU_API_BASE}/openapi/deviceBaseList`, {
     system: {
-      ...params,
+      time,
+      nonce,
+      appId,
+      accessToken,
       sign,
       ver: '1.0',
     },
@@ -95,18 +83,16 @@ async function getDeviceList(appId, appSecret, accessToken) {
  * Bind device to get live stream access
  */
 async function bindDeviceLive(appId, appSecret, accessToken, deviceId, channelId = '0') {
-  const params = {
-    time: Math.floor(Date.now() / 1000),
-    appId,
-    id: crypto.randomUUID(),
-    accessToken,
-  };
-
-  const sign = generateSign(params, appSecret);
+  const time = Math.floor(Date.now() / 1000);
+  const nonce = crypto.randomUUID();
+  const sign = generateSign(time, nonce, appSecret);
 
   const response = await axios.post(`${IMOU_API_BASE}/openapi/bindDeviceLive`, {
     system: {
-      ...params,
+      time,
+      nonce,
+      appId,
+      accessToken,
       sign,
       ver: '1.0',
     },
@@ -127,18 +113,16 @@ async function bindDeviceLive(appId, appSecret, accessToken, deviceId, channelId
  * Get live stream info (RTSP URL) from IMOU API
  */
 async function getLiveStreamInfo(appId, appSecret, accessToken, deviceId, channelId = '0', streamId = '0') {
-  const params = {
-    time: Math.floor(Date.now() / 1000),
-    appId,
-    id: crypto.randomUUID(),
-    accessToken,
-  };
-
-  const sign = generateSign(params, appSecret);
+  const time = Math.floor(Date.now() / 1000);
+  const nonce = crypto.randomUUID();
+  const sign = generateSign(time, nonce, appSecret);
 
   const response = await axios.post(`${IMOU_API_BASE}/openapi/getLiveStreamInfo`, {
     system: {
-      ...params,
+      time,
+      nonce,
+      appId,
+      accessToken,
       sign,
       ver: '1.0',
     },
