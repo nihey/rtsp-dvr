@@ -1,11 +1,26 @@
 {
-  "name": "imou-rstp-dvr",
+  "name": "imou-rtsp-dvr",
   "version": "1.0.0",
+  "description": "IMOU Camera RTSP Stream DVR Recorder",
   "main": "index.js",
+  "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js",
+    "record": "node index.js record"
   },
+  "keywords": [
+    "imou",
+    "rtsp",
+    "dvr",
+    "camera",
+    "recorder"
+  ],
   "author": "",
-  "license": "ISC",
-  "description": ""
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.7.2",
+    "commander": "^12.1.0",
+    "crypto-js": "^4.2.0",
+    "dotenv": "^16.4.5"
+  }
 }
