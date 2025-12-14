@@ -38,13 +38,15 @@ async function getAccessToken(appId, appSecret) {
       sign,
       ver: '1.0',
     },
+    id: nonce,
   });
 
   if (response.data.result?.code !== '0') {
     throw new Error(`Failed to get access token: ${response.data.result?.msg || 'Unknown error'}`);
   }
 
-  return response.data.result.data.accessToken;
+  const tokenData = response.data.result.data;
+  return tokenData.accessToken;
 }
 
 /**
@@ -60,9 +62,9 @@ async function getDeviceList(appId, appSecret, accessToken) {
       time,
       nonce,
       appId,
-      accessToken,
       sign,
       ver: '1.0',
+      token: accessToken,
     },
     params: {
       bindId: '',
@@ -70,6 +72,7 @@ async function getDeviceList(appId, appSecret, accessToken) {
       type: 'bindAndShare',
       needApInfo: true,
     },
+    id: nonce,
   });
 
   if (response.data.result?.code !== '0') {
@@ -92,14 +95,15 @@ async function bindDeviceLive(appId, appSecret, accessToken, deviceId, channelId
       time,
       nonce,
       appId,
-      accessToken,
       sign,
       ver: '1.0',
+      token: accessToken,
     },
     params: {
       deviceId,
       channelId,
     },
+    id: nonce,
   });
 
   if (response.data.result?.code !== '0') {
@@ -122,15 +126,16 @@ async function getLiveStreamInfo(appId, appSecret, accessToken, deviceId, channe
       time,
       nonce,
       appId,
-      accessToken,
       sign,
       ver: '1.0',
+      token: accessToken,
     },
     params: {
       deviceId,
       channelId,
       streamId,
     },
+    id: nonce,
   });
 
   if (response.data.result?.code !== '0') {
