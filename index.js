@@ -14,6 +14,9 @@ const program = new Command();
 // Default segment time in seconds (1 hour)
 const DEFAULT_SEGMENT_SECONDS = 3600;
 
+// Default retention in days (90 days)
+const DEFAULT_RETENTION_DAYS = 90;
+
 /**
  * Get segment time from env var or default
  */
@@ -30,6 +33,87 @@ function getSegmentSeconds() {
 }
 
 /**
+ * Get retention days from env var or default
+ */
+function getRetentionDays() {
+  const envValue = process.env.RETENTION_DAYS;
+  if (envValue) {
+    const parsed = parseInt(envValue, 10);
+    if (!isNaN(parsed) && parsed > 0) {
+      return parsed;
+    }
+    console.warn(`⚠️  Invalid RETENTION_DAYS value "${envValue}", using default ${DEFAULT_RETENTION_DAYS}`);
+  }
+  return DEFAULT_RETENTION_DAYS;
+}
+
+/**
+ * Clean up old recordings based on retention policy
+ */
+function cleanupOldRecordings(outputDir, retentionDays) {
+  const maxAgeMs = retentionDays * 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  let deletedCount = 0;
+  let freedBytes = 0;
+
+  try {
+    if (!fs.existsSync(outputDir)) {
+      return { deletedCount, freedBytes };
+    }
+
+    const files = fs.readdirSync(outputDir)
+      .filter(f => f.endsWith('.mp4'))
+      .map(f => path.join(outputDir, f));
+
+    for (const filePath of files) {
+      try {
+        const stats = fs.statSync(filePath);
+        const fileAge = now - stats.mtimeMs;
+
+        if (fileAge > maxAgeMs) {
+          const fileSize = stats.size;
+          fs.unlinkSync(filePath);
+          deletedCount++;
+          freedBytes += fileSize;
+          console.log(`🗑️  Deleted old recording: ${path.basename(filePath)}`);
+        }
+      } catch (err) {
+        console.error(`⚠️  Error checking/deleting ${filePath}: ${err.message}`);
+      }
+    }
+  } catch (err) {
+    console.error(`⚠️  Error cleaning up recordings: ${err.message}`);
+  }
+
+  return { deletedCount, freedBytes };
+}
+
+/**
+ * Start periodic cleanup of old recordings
+ */
+function startRetentionCleanup(outputDir, retentionDays) {
+  console.log(`🗓️  Retention policy: ${retentionDays} days`);
+
+  // Run cleanup immediately on start
+  const initial = cleanupOldRecordings(outputDir, retentionDays);
+  if (initial.deletedCount > 0) {
+    const freedMB = (initial.freedBytes / 1024 / 1024).toFixed(2);
+    console.log(`🗑️  Initial cleanup: deleted ${initial.deletedCount} file(s), freed ${freedMB} MB`);
+  }
+
+  // Run cleanup every hour
+  const cleanupInterval = setInterval(() => {
+    const result = cleanupOldRecordings(outputDir, retentionDays);
+    if (result.deletedCount > 0) {
+      const freedMB = (result.freedBytes / 1024 / 1024).toFixed(2);
+      console.log(`🗑️  Cleanup: deleted ${result.deletedCount} file(s), freed ${freedMB} MB`);
+    }
+  }, 60 * 60 * 1000); // Every hour
+
+  return () => clearInterval(cleanupInterval);
+}
+
+/**
  * Get S3 client configuration from env vars
  */
 function getS3Config() {
@@ -39,6 +123,8 @@ function getS3Config() {
   const secretAccessKey = process.env.S3_SECRET_ACCESS_KEY;
   const region = process.env.S3_REGION || 'us-east-1';
   const prefix = process.env.S3_PREFIX || '';
+  // Delete local files after upload (default: true)
+  const deleteAfterUpload = process.env.S3_DELETE_AFTER_UPLOAD !== 'false';
 
   if (!endpoint || !bucket || !accessKeyId || !secretAccessKey) {
     return null;
@@ -51,6 +137,7 @@ function getS3Config() {
     secretAccessKey,
     region,
     prefix,
+    deleteAfterUpload,
   };
 }
 
@@ -72,7 +159,7 @@ function createS3Client(config) {
 /**
  * Upload file to S3-compatible storage
  */
-async function uploadToS3(filePath, s3Config) {
+async function uploadToS3(filePath, s3Config, deleteAfterUpload = true) {
   const s3Client = createS3Client(s3Config);
   const fileName = path.basename(filePath);
   const key = s3Config.prefix ? `${s3Config.prefix}/${fileName}` : fileName;
@@ -90,6 +177,17 @@ async function uploadToS3(filePath, s3Config) {
 
     await s3Client.send(command);
     console.log(`✅ Uploaded ${fileName} to s3://${s3Config.bucket}/${key}`);
+
+    // Delete local file after successful upload
+    if (deleteAfterUpload) {
+      try {
+        fs.unlinkSync(filePath);
+        console.log(`🗑️  Deleted local file: ${fileName}`);
+      } catch (deleteError) {
+        console.error(`⚠️  Failed to delete local file ${fileName}: ${deleteError.message}`);
+      }
+    }
+
     return true;
   } catch (error) {
     console.error(`❌ Failed to upload ${fileName}: ${error.message}`);
@@ -138,7 +236,7 @@ function watchAndUploadSegments(outputDir, s3Config, prefix) {
           // File size stable or forced, upload it
           pendingFiles.delete(filePath);
           uploadedFiles.add(filePath);
-          await uploadToS3(filePath, s3Config);
+          await uploadToS3(filePath, s3Config, s3Config.deleteAfterUpload);
         } catch (err) {
           // File might be locked or deleted
           console.error(`⚠️  Error processing ${filePath}: ${err.message}`);
@@ -374,6 +472,10 @@ function recordStream(rtspUrl, outputDir, options = {}) {
     s3Watcher = watchAndUploadSegments(outputDir, s3Config, prefix);
   }
 
+  // Setup retention cleanup
+  const retentionDays = getRetentionDays();
+  const stopRetentionCleanup = startRetentionCleanup(outputDir, retentionDays);
+
   const ffmpegArgs = [
     '-rtsp_transport', 'tcp',
     '-rtsp_flags', 'prefer_tcp',
@@ -431,6 +533,9 @@ function recordStream(rtspUrl, outputDir, options = {}) {
     } else {
       console.log(`⚠️  FFmpeg exited with code ${code}`);
     }
+
+    // Stop retention cleanup
+    stopRetentionCleanup();
 
     // Perform final S3 upload
     if (s3Watcher) {
@@ -637,4 +742,3 @@ program
   });
 
 program.parse();
-

@@ -24,6 +24,7 @@ RUN mkdir -p /app/recordings
 # Set default environment variables
 ENV NODE_ENV=production
 ENV SEGMENT_SECONDS=3600
+ENV RETENTION_DAYS=90
 
 # Default output directory
 VOLUME ["/app/recordings"]

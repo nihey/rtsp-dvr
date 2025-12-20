@@ -44,6 +44,7 @@ You can configure the DVR using environment variables. Create a `.env` file in t
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `SEGMENT_SECONDS` | Duration of each recording segment in seconds | `3600` (1 hour) |
+| `RETENTION_DAYS` | Number of days to keep recordings before auto-deletion | `90` (90 days) |
 | `RTSP_URL` | RTSP stream URL (for `url` command) | - |
 | `RTSP_USERNAME` | RTSP username (will be URL-encoded automatically) | - |
 | `RTSP_PASSWORD` | RTSP password (will be URL-encoded automatically) | - |
@@ -60,6 +61,7 @@ Configure these variables to automatically upload completed recording segments t
 | `S3_SECRET_ACCESS_KEY` | S3 secret access key | Yes |
 | `S3_REGION` | S3 region (e.g., `us-east-1`) | No (default: `us-east-1`) |
 | `S3_PREFIX` | Prefix/folder for uploaded files (e.g., `recordings/camera1`) | No |
+| `S3_DELETE_AFTER_UPLOAD` | Delete local files after successful S3 upload (`true`/`false`) | No (default: `true`) |
 
 **Example `.env` file:**
 ```bash
@@ -69,6 +71,7 @@ IMOU_APP_SECRET=your_app_secret
 
 # Recording settings
 SEGMENT_SECONDS=1800
+RETENTION_DAYS=30
 
 # RTSP URL configuration (for 'url' command)
 RTSP_URL=rtsp://192.168.1.100:554/cam/realmonitor?channel=1&subtype=0
@@ -209,12 +212,27 @@ If your password contains special characters like `@`, `:`, `#`, `!`, `%`, etc.,
    - `#` → `%23`
    - `!` → `%21`
    - `%` → `%25`
-   
+
    Example: Password `p@ss:word` becomes `p%40ss%3Aword`:
    ```bash
    node index.js url \
      --rtsp "rtsp://admin:p%40ss%3Aword@192.168.1.100:554/cam/realmonitor?channel=1&subtype=0"
    ```
+
+## Recording Retention
+
+The DVR automatically deletes old recordings based on the `RETENTION_DAYS` setting (default: 90 days).
+
+- Cleanup runs immediately on startup and every hour thereafter
+- Only `.mp4` files in the output directory are considered
+- Files older than the retention period are automatically deleted
+- Freed disk space is logged
+
+**Example output:**
+```
+🗓️  Retention policy: 30 days
+🗑️  Initial cleanup: deleted 5 file(s), freed 1024.50 MB
+```
 
 ## S3 Upload Behavior
 
@@ -273,6 +291,7 @@ docker run -d \
   -e RTSP_USERNAME="admin" \
   -e RTSP_PASSWORD="your_password" \
   -e SEGMENT_SECONDS="1800" \
+  -e RETENTION_DAYS="30" \
   -e S3_ENDPOINT="https://minio.example.com" \
   -e S3_BUCKET="camera-recordings" \
   -e S3_ACCESS_KEY_ID="your_access_key" \
@@ -300,6 +319,7 @@ services:
       - RTSP_USERNAME=admin
       - RTSP_PASSWORD=your_password
       - SEGMENT_SECONDS=1800
+      - RETENTION_DAYS=30
       - S3_ENDPOINT=https://minio.example.com
       - S3_BUCKET=camera-recordings
       - S3_ACCESS_KEY_ID=your_access_key
@@ -330,4 +350,3 @@ docker stop imou-dvr
 ## License
 
 MIT
-
