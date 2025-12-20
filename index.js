@@ -49,16 +49,18 @@ function getRetentionDays() {
 
 /**
  * Clean up old recordings based on retention policy
+ * Also removes invalid small files (< 1KB) which indicate failed recordings
  */
 function cleanupOldRecordings(outputDir, retentionDays) {
   const maxAgeMs = retentionDays * 24 * 60 * 60 * 1000;
   const now = Date.now();
   let deletedCount = 0;
   let freedBytes = 0;
+  let invalidCount = 0;
 
   try {
     if (!fs.existsSync(outputDir)) {
-      return { deletedCount, freedBytes };
+      return { deletedCount, freedBytes, invalidCount };
     }
 
     const files = fs.readdirSync(outputDir)
@@ -69,6 +71,15 @@ function cleanupOldRecordings(outputDir, retentionDays) {
       try {
         const stats = fs.statSync(filePath);
         const fileAge = now - stats.mtimeMs;
+
+        // Delete invalid small files (< 1KB) that are older than 1 minute
+        // (give ffmpeg time to write data before considering it invalid)
+        if (stats.size < 1024 && fileAge > 60000) {
+          fs.unlinkSync(filePath);
+          invalidCount++;
+          console.log(`🗑️  Deleted invalid recording: ${path.basename(filePath)} (${stats.size} bytes)`);
+          continue;
+        }
 
         if (fileAge > maxAgeMs) {
           const fileSize = stats.size;
@@ -85,7 +96,7 @@ function cleanupOldRecordings(outputDir, retentionDays) {
     console.error(`⚠️  Error cleaning up recordings: ${err.message}`);
   }
 
-  return { deletedCount, freedBytes };
+  return { deletedCount, freedBytes, invalidCount };
 }
 
 /**
@@ -96,17 +107,23 @@ function startRetentionCleanup(outputDir, retentionDays) {
 
   // Run cleanup immediately on start
   const initial = cleanupOldRecordings(outputDir, retentionDays);
-  if (initial.deletedCount > 0) {
+  if (initial.deletedCount > 0 || initial.invalidCount > 0) {
     const freedMB = (initial.freedBytes / 1024 / 1024).toFixed(2);
-    console.log(`🗑️  Initial cleanup: deleted ${initial.deletedCount} file(s), freed ${freedMB} MB`);
+    const parts = [];
+    if (initial.deletedCount > 0) parts.push(`${initial.deletedCount} old file(s)`);
+    if (initial.invalidCount > 0) parts.push(`${initial.invalidCount} invalid file(s)`);
+    console.log(`🗑️  Initial cleanup: deleted ${parts.join(', ')}${initial.freedBytes > 0 ? `, freed ${freedMB} MB` : ''}`);
   }
 
   // Run cleanup every hour
   const cleanupInterval = setInterval(() => {
     const result = cleanupOldRecordings(outputDir, retentionDays);
-    if (result.deletedCount > 0) {
+    if (result.deletedCount > 0 || result.invalidCount > 0) {
       const freedMB = (result.freedBytes / 1024 / 1024).toFixed(2);
-      console.log(`🗑️  Cleanup: deleted ${result.deletedCount} file(s), freed ${freedMB} MB`);
+      const parts = [];
+      if (result.deletedCount > 0) parts.push(`${result.deletedCount} old file(s)`);
+      if (result.invalidCount > 0) parts.push(`${result.invalidCount} invalid file(s)`);
+      console.log(`🗑️  Cleanup: deleted ${parts.join(', ')}${result.freedBytes > 0 ? `, freed ${freedMB} MB` : ''}`);
     }
   }, 60 * 60 * 1000); // Every hour
 
@@ -226,9 +243,14 @@ function watchAndUploadSegments(outputDir, s3Config, prefix) {
             continue;
           }
 
-          // Skip empty or very small files (less than 1KB)
+          // Delete empty or very small files (less than 1KB) - these are invalid
           if (stats.size < 1024) {
-            console.log(`⏭️  Skipping small file: ${path.basename(filePath)} (${stats.size} bytes)`);
+            console.log(`🗑️  Deleting invalid file: ${path.basename(filePath)} (${stats.size} bytes)`);
+            try {
+              fs.unlinkSync(filePath);
+            } catch (err) {
+              console.error(`⚠️  Failed to delete invalid file: ${err.message}`);
+            }
             uploadedFiles.add(filePath);
             continue;
           }
@@ -441,7 +463,138 @@ function injectCredentials(rtspUrl, username, password) {
 }
 
 /**
- * Record RTSP stream using FFmpeg
+ * Format bytes to human readable size
+ */
+function formatFileSize(bytes) {
+  if (bytes === 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+  return `${(bytes / Math.pow(1024, i)).toFixed(2)} ${units[i]}`;
+}
+
+/**
+ * Get file size safely (returns 0 if file doesn't exist)
+ */
+function getFileSize(filePath) {
+  try {
+    const stats = fs.statSync(filePath);
+    return stats.size;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Generate output filename for a segment
+ */
+function generateOutputFilename(outputDir, prefix, segmentIndex) {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const paddedIndex = String(segmentIndex).padStart(3, '0');
+  return path.join(outputDir, `${prefix}_${timestamp}_${paddedIndex}.mp4`);
+}
+
+/**
+ * Start a single ffmpeg recording process
+ * Returns a promise that resolves when the process exits
+ */
+function startFfmpegProcess(rtspUrl, outputFile, options = {}) {
+  const { onProgress } = options;
+
+  const ffmpegArgs = [
+    // Input options - use TCP for more reliable RTSP streaming
+    '-rtsp_transport', 'tcp',
+    '-rtsp_flags', 'prefer_tcp',
+    '-i', rtspUrl,
+    // Output options
+    '-c:v', 'copy',
+    '-c:a', 'aac',
+    '-movflags', '+faststart',
+    '-flush_packets', '1',  // Flush packets to disk immediately
+    '-fflags', '+flush_packets',  // Ensure packets are flushed
+    '-y',  // Overwrite output file if exists
+    outputFile,
+  ];
+
+  const ffmpeg = spawn('ffmpeg', ffmpegArgs);
+  let lastFrameLog = 0;
+
+  ffmpeg.stdout.on('data', (data) => {
+    process.stdout.write(data);
+  });
+
+  ffmpeg.stderr.on('data', (data) => {
+    const message = data.toString();
+    // Log important messages and connection info
+    if (message.includes('Error') || message.includes('error') ||
+      message.includes('Opening') || message.includes('Stream') ||
+      message.includes('Input') || message.includes('Output') ||
+      message.includes('Duration') || message.includes('Video:') ||
+      message.includes('Audio:') || message.includes('frame=')) {
+      // For frame progress, only show occasionally
+      if (message.includes('frame=')) {
+        const now = Date.now();
+        if (now - lastFrameLog > 10000) {
+          lastFrameLog = now;
+          const frameMatch = message.match(/frame=\s*(\d+)/);
+          const timeMatch = message.match(/time=(\d+:\d+:\d+\.\d+)/);
+          if (frameMatch && timeMatch) {
+            // Get current file size
+            const fileSize = getFileSize(outputFile);
+            console.log(`📹 Recording: frame ${frameMatch[1]}, time ${timeMatch[1]}, size ${formatFileSize(fileSize)}`);
+            if (onProgress) onProgress({ frame: frameMatch[1], time: timeMatch[1], size: fileSize });
+          }
+        }
+      } else {
+        console.log(message.trim());
+      }
+    }
+  });
+
+  ffmpeg.on('error', (error) => {
+    console.error(`❌ FFmpeg error: ${error.message}`);
+    console.error('Make sure FFmpeg is installed and available in your PATH');
+  });
+
+  return ffmpeg;
+}
+
+/**
+ * Stop ffmpeg process gracefully
+ * Returns a promise that resolves when the process has exited
+ */
+function stopFfmpegProcess(ffmpeg, forceTimeout = 2000) {
+  return new Promise((resolve) => {
+    if (!ffmpeg || ffmpeg.killed) {
+      resolve(0);
+      return;
+    }
+
+    let forceKillTimer = null;
+
+    // Set up exit handler before sending signal
+    ffmpeg.once('close', (code) => {
+      if (forceKillTimer) {
+        clearTimeout(forceKillTimer);
+      }
+      resolve(code);
+    });
+
+    // Send SIGTERM for graceful shutdown (allows ffmpeg to finalize the file)
+    ffmpeg.kill('SIGTERM');
+
+    // Force kill after timeout if still running
+    forceKillTimer = setTimeout(() => {
+      if (!ffmpeg.killed) {
+        console.log('⚠️  Force killing ffmpeg...');
+        ffmpeg.kill('SIGKILL');
+      }
+    }, forceTimeout);
+  });
+}
+
+/**
+ * Record RTSP stream using FFmpeg with manual segment management
+ * Stops and restarts ffmpeg at segment boundaries for precise timing
  */
 function recordStream(rtspUrl, outputDir, options = {}) {
   const defaultSegmentTime = getSegmentSeconds();
@@ -451,9 +604,6 @@ function recordStream(rtspUrl, outputDir, options = {}) {
   if (!fs.existsSync(outputDir)) {
     fs.mkdirSync(outputDir, { recursive: true });
   }
-
-  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const outputPattern = path.join(outputDir, `${prefix}_${timestamp}_%03d.mp4`);
 
   console.log(`🎥 Starting recording...`);
   console.log(`📁 Output directory: ${outputDir}`);
@@ -476,97 +626,153 @@ function recordStream(rtspUrl, outputDir, options = {}) {
   const retentionDays = getRetentionDays();
   const stopRetentionCleanup = startRetentionCleanup(outputDir, retentionDays);
 
-  const ffmpegArgs = [
-    '-rtsp_transport', 'tcp',
-    '-rtsp_flags', 'prefer_tcp',
-    '-i', rtspUrl,
-    '-c:v', 'copy',
-    '-c:a', 'aac',
-    '-f', 'segment',
-    '-segment_time', String(segmentTime),
-    '-segment_format', 'mp4',
-    '-segment_format_options', 'movflags=+faststart+frag_keyframe+empty_moov',
-    '-reset_timestamps', '1',
-    '-strftime', '0',
-    outputPattern,
-  ];
+  // State management
+  let currentFfmpeg = null;
+  let currentOutputFile = null;
+  let segmentIndex = 0;
+  let segmentTimer = null;
+  let isShuttingDown = false;
+  let isRotating = false;
 
-  const ffmpeg = spawn('ffmpeg', ffmpegArgs);
+  /**
+   * Start recording a new segment
+   */
+  const startNewSegment = () => {
+    if (isShuttingDown) return;
 
-  ffmpeg.stdout.on('data', (data) => {
-    process.stdout.write(data);
-  });
+    currentOutputFile = generateOutputFilename(outputDir, prefix, segmentIndex);
+    console.log(`\n📼 Starting segment ${segmentIndex}: ${path.basename(currentOutputFile)}`);
 
-  ffmpeg.stderr.on('data', (data) => {
-    const message = data.toString();
-    // Log important messages and connection info
-    if (message.includes('Error') || message.includes('error') ||
-      message.includes('Opening') || message.includes('Stream') ||
-      message.includes('Input') || message.includes('Output') ||
-      message.includes('Duration') || message.includes('Video:') ||
-      message.includes('Audio:') || message.includes('frame=')) {
-      // For frame progress, only show occasionally
-      if (message.includes('frame=')) {
-        // Only log every few seconds (frame updates are too frequent)
-        if (!recordStream.lastFrameLog || Date.now() - recordStream.lastFrameLog > 10000) {
-          recordStream.lastFrameLog = Date.now();
-          const frameMatch = message.match(/frame=\s*(\d+)/);
-          const timeMatch = message.match(/time=(\d+:\d+:\d+\.\d+)/);
-          if (frameMatch && timeMatch) {
-            console.log(`📹 Recording: frame ${frameMatch[1]}, time ${timeMatch[1]}`);
-          }
+    currentFfmpeg = startFfmpegProcess(rtspUrl, currentOutputFile);
+
+    // Handle unexpected ffmpeg exit (crash, connection lost, etc.)
+    currentFfmpeg.once('close', (code) => {
+      if (isShuttingDown || isRotating) return;
+
+      if (code !== 0) {
+        console.log(`⚠️  FFmpeg exited unexpectedly with code ${code}, restarting in 5 seconds...`);
+        // Clear the segment timer since we're restarting
+        if (segmentTimer) {
+          clearTimeout(segmentTimer);
+          segmentTimer = null;
         }
-      } else {
-        console.log(message.trim());
+        // Restart after a delay
+        setTimeout(() => {
+          if (!isShuttingDown) {
+            segmentIndex++;
+            startNewSegment();
+          }
+        }, 5000);
       }
+    });
+
+    // Schedule segment rotation
+    segmentTimer = setTimeout(async () => {
+      await rotateSegment();
+    }, segmentTime * 1000);
+
+    segmentIndex++;
+  };
+
+  /**
+   * Rotate to a new segment (stop current, start new)
+   */
+  const rotateSegment = async () => {
+    if (isShuttingDown || isRotating) return;
+
+    isRotating = true;
+    console.log(`\n🔄 Rotating segment...`);
+
+    // Clear existing timer
+    if (segmentTimer) {
+      clearTimeout(segmentTimer);
+      segmentTimer = null;
     }
-  });
 
-  ffmpeg.on('error', (error) => {
-    console.error(`❌ FFmpeg error: ${error.message}`);
-    console.error('Make sure FFmpeg is installed and available in your PATH');
-  });
+    // Stop current ffmpeg process
+    const oldFfmpeg = currentFfmpeg;
+    const oldOutputFile = currentOutputFile;
+    currentFfmpeg = null;
+    currentOutputFile = null;
 
-  ffmpeg.on('close', async (code) => {
-    if (code === 0) {
-      console.log('✅ Recording finished successfully');
-    } else {
-      console.log(`⚠️  FFmpeg exited with code ${code}`);
+    if (oldFfmpeg) {
+      await stopFfmpegProcess(oldFfmpeg);
+      // Log file size after ffmpeg has finalized
+      const fileSize = getFileSize(oldOutputFile);
+      console.log(`✅ Segment finalized: ${path.basename(oldOutputFile)} (${formatFileSize(fileSize)})`);
+    }
+
+    isRotating = false;
+
+    // Start new segment
+    startNewSegment();
+  };
+
+  /**
+   * Graceful shutdown - stops recording and uploads immediately
+   */
+  const gracefulShutdown = async (signal) => {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+
+    console.log(`\n🛑 Received ${signal}, stopping recording immediately...`);
+
+    // Clear segment timer immediately
+    if (segmentTimer) {
+      clearTimeout(segmentTimer);
+      segmentTimer = null;
+    }
+
+    // Stop current ffmpeg process
+    if (currentFfmpeg) {
+      const ffmpegToStop = currentFfmpeg;
+      const finalOutputFile = currentOutputFile;
+      currentFfmpeg = null;
+      currentOutputFile = null;
+      const code = await stopFfmpegProcess(ffmpegToStop);
+      if (code === 0 || code === 255 || code === null) {
+        const fileSize = getFileSize(finalOutputFile);
+        console.log(`✅ Final segment saved: ${path.basename(finalOutputFile)} (${formatFileSize(fileSize)})`);
+      } else {
+        console.log(`⚠️  FFmpeg exited with code ${code}`);
+      }
     }
 
     // Stop retention cleanup
     stopRetentionCleanup();
 
-    // Perform final S3 upload
+    // Perform final S3 upload immediately
     if (s3Watcher) {
+      console.log('☁️  Uploading final segments to S3...');
       await s3Watcher.finalUpload();
     }
 
-    process.exit(code || 0);
-  });
-
-  // Graceful shutdown handler
-  const gracefulShutdown = async (signal) => {
-    console.log(`\n🛑 Received ${signal}, stopping recording...`);
-
-    // Stop ffmpeg gracefully
-    ffmpeg.kill('SIGTERM');
-
-    // Give ffmpeg time to finish writing
-    await new Promise(resolve => setTimeout(resolve, 1000));
-
-    // If still running, force kill
-    if (!ffmpeg.killed) {
-      ffmpeg.kill('SIGKILL');
-    }
+    console.log('👋 Recording stopped');
+    process.exit(0);
   };
 
-  // Handle various shutdown signals
-  process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-  process.on('SIGHUP', () => gracefulShutdown('SIGHUP'));
+  // Signal handler wrapper to properly handle async shutdown
+  const handleSignal = (signal) => {
+    // Prevent default behavior and handle shutdown ourselves
+    gracefulShutdown(signal).catch((err) => {
+      console.error(`❌ Error during shutdown: ${err.message}`);
+      process.exit(1);
+    });
+  };
 
-  return ffmpeg;
+  // Handle shutdown signals - use 'once' to prevent multiple handlers
+  process.once('SIGINT', () => handleSignal('SIGINT'));
+  process.once('SIGTERM', () => handleSignal('SIGTERM'));
+  process.once('SIGHUP', () => handleSignal('SIGHUP'));
+
+  // Start the first segment
+  startNewSegment();
+
+  // Return control object
+  return {
+    stop: () => gracefulShutdown('manual'),
+    rotate: () => rotateSegment(),
+  };
 }
 
 // Main program setup
