@@ -255,6 +255,78 @@ Press `Ctrl+C` to gracefully stop the recording.
 3. Create an application to get your App ID and App Secret
 4. Bind your camera to the application
 
+## Docker Deployment
+
+### Build the Docker image
+
+```bash
+docker build -t imou-rtsp-dvr .
+```
+
+### Run with Docker
+
+```bash
+docker run -d \
+  --name imou-dvr \
+  --restart unless-stopped \
+  -e RTSP_URL="rtsp://192.168.1.100:554/cam/realmonitor?channel=1&subtype=0" \
+  -e RTSP_USERNAME="admin" \
+  -e RTSP_PASSWORD="your_password" \
+  -e SEGMENT_SECONDS="1800" \
+  -e S3_ENDPOINT="https://minio.example.com" \
+  -e S3_BUCKET="camera-recordings" \
+  -e S3_ACCESS_KEY_ID="your_access_key" \
+  -e S3_SECRET_ACCESS_KEY="your_secret_key" \
+  -e S3_PREFIX="camera1" \
+  -v /path/to/local/recordings:/app/recordings \
+  imou-rtsp-dvr
+```
+
+### Run with Docker Compose
+
+Create a `docker-compose.yml`:
+
+```yaml
+version: '3.8'
+
+services:
+  dvr:
+    build: .
+    image: imou-rtsp-dvr
+    container_name: imou-dvr
+    restart: unless-stopped
+    environment:
+      - RTSP_URL=rtsp://192.168.1.100:554/cam/realmonitor?channel=1&subtype=0
+      - RTSP_USERNAME=admin
+      - RTSP_PASSWORD=your_password
+      - SEGMENT_SECONDS=1800
+      - S3_ENDPOINT=https://minio.example.com
+      - S3_BUCKET=camera-recordings
+      - S3_ACCESS_KEY_ID=your_access_key
+      - S3_SECRET_ACCESS_KEY=your_secret_key
+      - S3_PREFIX=camera1
+    volumes:
+      - ./recordings:/app/recordings
+```
+
+Then run:
+```bash
+docker-compose up -d
+```
+
+### Graceful Shutdown
+
+The container handles shutdown signals (SIGINT, SIGTERM, SIGHUP) gracefully:
+1. Stops FFmpeg recording
+2. Waits for files to finalize
+3. Uploads any remaining segments to S3
+4. Exits cleanly
+
+To stop the container gracefully:
+```bash
+docker stop imou-dvr
+```
+
 ## License
 
 MIT

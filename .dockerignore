@@ -1,0 +1,12 @@
+node_modules
+npm-debug.log
+.env
+.env.*
+recordings/
+*.mp4
+.git
+.gitignore
+README.md
+Dockerfile
+.dockerignore
+

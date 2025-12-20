@@ -99,15 +99,17 @@ async function uploadToS3(filePath, s3Config) {
 
 /**
  * Watch directory for new segment files and upload them
+ * Returns an object with stop() and finalUpload() methods
  */
 function watchAndUploadSegments(outputDir, s3Config, prefix) {
   const uploadedFiles = new Set();
   const pendingFiles = new Map();
+  let isRunning = true;
 
   console.log(`☁️  S3 upload enabled: s3://${s3Config.bucket}/${s3Config.prefix || ''}`);
 
-  // Check for completed segments periodically
-  const checkInterval = setInterval(async () => {
+  // Function to scan and upload files
+  const scanAndUpload = async (forceUpload = false) => {
     try {
       const files = fs.readdirSync(outputDir)
         .filter(f => f.startsWith(prefix) && f.endsWith('.mp4'))
@@ -120,26 +122,58 @@ function watchAndUploadSegments(outputDir, s3Config, prefix) {
           const stats = fs.statSync(filePath);
           const previousSize = pendingFiles.get(filePath);
 
-          // File is still being written if size changed
-          if (previousSize !== stats.size) {
+          // File is still being written if size changed (unless forceUpload)
+          if (!forceUpload && previousSize !== stats.size) {
             pendingFiles.set(filePath, stats.size);
             continue;
           }
 
-          // File size stable, it's complete - upload it
+          // Skip empty or very small files (less than 1KB)
+          if (stats.size < 1024) {
+            console.log(`⏭️  Skipping small file: ${path.basename(filePath)} (${stats.size} bytes)`);
+            uploadedFiles.add(filePath);
+            continue;
+          }
+
+          // File size stable or forced, upload it
           pendingFiles.delete(filePath);
           uploadedFiles.add(filePath);
           await uploadToS3(filePath, s3Config);
         } catch (err) {
           // File might be locked or deleted
+          console.error(`⚠️  Error processing ${filePath}: ${err.message}`);
         }
       }
     } catch (err) {
       // Directory might not exist yet
     }
+  };
+
+  // Check for completed segments periodically
+  const checkInterval = setInterval(() => {
+    if (isRunning) {
+      scanAndUpload(false);
+    }
   }, 5000); // Check every 5 seconds
 
-  return () => clearInterval(checkInterval);
+  return {
+    // Stop the periodic check
+    stop: () => {
+      isRunning = false;
+      clearInterval(checkInterval);
+    },
+    // Final upload - wait a bit for ffmpeg to finish writing, then force upload all
+    finalUpload: async () => {
+      isRunning = false;
+      clearInterval(checkInterval);
+      console.log('☁️  Waiting for files to finalize...');
+      // Wait 2 seconds for ffmpeg to finish writing
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      console.log('☁️  Uploading remaining files...');
+      await scanAndUpload(true);
+      console.log('☁️  Final upload complete');
+    }
+  };
 }
 
 // IMOU Open Platform API base URL
@@ -335,9 +369,9 @@ function recordStream(rtspUrl, outputDir, options = {}) {
 
   // Setup S3 upload if configured
   const s3Config = getS3Config();
-  let stopS3Watcher = null;
+  let s3Watcher = null;
   if (s3Config) {
-    stopS3Watcher = watchAndUploadSegments(outputDir, s3Config, prefix);
+    s3Watcher = watchAndUploadSegments(outputDir, s3Config, prefix);
   }
 
   const ffmpegArgs = [
@@ -391,27 +425,41 @@ function recordStream(rtspUrl, outputDir, options = {}) {
     console.error('Make sure FFmpeg is installed and available in your PATH');
   });
 
-  ffmpeg.on('close', (code) => {
-    if (stopS3Watcher) {
-      stopS3Watcher();
-    }
+  ffmpeg.on('close', async (code) => {
     if (code === 0) {
       console.log('✅ Recording finished successfully');
     } else {
       console.log(`⚠️  FFmpeg exited with code ${code}`);
     }
+
+    // Perform final S3 upload
+    if (s3Watcher) {
+      await s3Watcher.finalUpload();
+    }
+
+    process.exit(code || 0);
   });
 
-  // Handle graceful shutdown
-  process.on('SIGINT', () => {
-    console.log('\n🛑 Stopping recording...');
-    ffmpeg.kill('SIGINT');
-  });
+  // Graceful shutdown handler
+  const gracefulShutdown = async (signal) => {
+    console.log(`\n🛑 Received ${signal}, stopping recording...`);
 
-  process.on('SIGTERM', () => {
-    console.log('\n🛑 Stopping recording...');
+    // Stop ffmpeg gracefully
     ffmpeg.kill('SIGTERM');
-  });
+
+    // Give ffmpeg time to finish writing
+    await new Promise(resolve => setTimeout(resolve, 1000));
+
+    // If still running, force kill
+    if (!ffmpeg.killed) {
+      ffmpeg.kill('SIGKILL');
+    }
+  };
+
+  // Handle various shutdown signals
+  process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+  process.on('SIGHUP', () => gracefulShutdown('SIGHUP'));
 
   return ffmpeg;
 }
