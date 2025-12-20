@@ -7,8 +7,140 @@ import crypto from 'crypto';
 import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 
 const program = new Command();
+
+// Default segment time in seconds (1 hour)
+const DEFAULT_SEGMENT_SECONDS = 3600;
+
+/**
+ * Get segment time from env var or default
+ */
+function getSegmentSeconds() {
+  const envValue = process.env.SEGMENT_SECONDS;
+  if (envValue) {
+    const parsed = parseInt(envValue, 10);
+    if (!isNaN(parsed) && parsed > 0) {
+      return parsed;
+    }
+    console.warn(`⚠️  Invalid SEGMENT_SECONDS value "${envValue}", using default ${DEFAULT_SEGMENT_SECONDS}`);
+  }
+  return DEFAULT_SEGMENT_SECONDS;
+}
+
+/**
+ * Get S3 client configuration from env vars
+ */
+function getS3Config() {
+  const endpoint = process.env.S3_ENDPOINT;
+  const bucket = process.env.S3_BUCKET;
+  const accessKeyId = process.env.S3_ACCESS_KEY_ID;
+  const secretAccessKey = process.env.S3_SECRET_ACCESS_KEY;
+  const region = process.env.S3_REGION || 'us-east-1';
+  const prefix = process.env.S3_PREFIX || '';
+
+  if (!endpoint || !bucket || !accessKeyId || !secretAccessKey) {
+    return null;
+  }
+
+  return {
+    endpoint,
+    bucket,
+    accessKeyId,
+    secretAccessKey,
+    region,
+    prefix,
+  };
+}
+
+/**
+ * Create S3 client from config
+ */
+function createS3Client(config) {
+  return new S3Client({
+    endpoint: config.endpoint,
+    region: config.region,
+    credentials: {
+      accessKeyId: config.accessKeyId,
+      secretAccessKey: config.secretAccessKey,
+    },
+    forcePathStyle: true, // Required for S3-compatible services like MinIO
+  });
+}
+
+/**
+ * Upload file to S3-compatible storage
+ */
+async function uploadToS3(filePath, s3Config) {
+  const s3Client = createS3Client(s3Config);
+  const fileName = path.basename(filePath);
+  const key = s3Config.prefix ? `${s3Config.prefix}/${fileName}` : fileName;
+
+  console.log(`☁️  Uploading ${fileName} to S3...`);
+
+  try {
+    const fileContent = fs.readFileSync(filePath);
+    const command = new PutObjectCommand({
+      Bucket: s3Config.bucket,
+      Key: key,
+      Body: fileContent,
+      ContentType: 'video/mp4',
+    });
+
+    await s3Client.send(command);
+    console.log(`✅ Uploaded ${fileName} to s3://${s3Config.bucket}/${key}`);
+    return true;
+  } catch (error) {
+    console.error(`❌ Failed to upload ${fileName}: ${error.message}`);
+    return false;
+  }
+}
+
+/**
+ * Watch directory for new segment files and upload them
+ */
+function watchAndUploadSegments(outputDir, s3Config, prefix) {
+  const uploadedFiles = new Set();
+  const pendingFiles = new Map();
+
+  console.log(`☁️  S3 upload enabled: s3://${s3Config.bucket}/${s3Config.prefix || ''}`);
+
+  // Check for completed segments periodically
+  const checkInterval = setInterval(async () => {
+    try {
+      const files = fs.readdirSync(outputDir)
+        .filter(f => f.startsWith(prefix) && f.endsWith('.mp4'))
+        .map(f => path.join(outputDir, f));
+
+      for (const filePath of files) {
+        if (uploadedFiles.has(filePath)) continue;
+
+        try {
+          const stats = fs.statSync(filePath);
+          const previousSize = pendingFiles.get(filePath);
+
+          // File is still being written if size changed
+          if (previousSize !== stats.size) {
+            pendingFiles.set(filePath, stats.size);
+            continue;
+          }
+
+          // File size stable, it's complete - upload it
+          pendingFiles.delete(filePath);
+          uploadedFiles.add(filePath);
+          await uploadToS3(filePath, s3Config);
+        } catch (err) {
+          // File might be locked or deleted
+        }
+      }
+    } catch (err) {
+      // Directory might not exist yet
+    }
+  }, 5000); // Check every 5 seconds
+
+  return () => clearInterval(checkInterval);
+}
 
 // IMOU Open Platform API base URL
 const IMOU_API_BASE = 'https://openapi.easy4ip.com';
@@ -147,16 +279,41 @@ async function getLiveStreamInfo(appId, appSecret, accessToken, deviceId, channe
 
 /**
  * Construct local RTSP URL for direct camera access
+ * URL-encodes username and password to handle special characters
  */
 function constructLocalRtspUrl(ip, username, password, channel = 1, subtype = 0, port = 554) {
-  return `rtsp://${username}:${password}@${ip}:${port}/cam/realmonitor?channel=${channel}&subtype=${subtype}`;
+  const encodedUsername = encodeURIComponent(username);
+  const encodedPassword = encodeURIComponent(password);
+  return `rtsp://${encodedUsername}:${encodedPassword}@${ip}:${port}/cam/realmonitor?channel=${channel}&subtype=${subtype}`;
+}
+
+/**
+ * Inject credentials into an RTSP URL
+ * Handles URLs with or without existing credentials
+ */
+function injectCredentials(rtspUrl, username, password) {
+  const encodedUsername = encodeURIComponent(username);
+  const encodedPassword = encodeURIComponent(password);
+
+  // Check if URL already has credentials (user:pass@host pattern after rtsp://)
+  const hasCredentials = /^rtsp:\/\/[^\/]+@/.test(rtspUrl);
+
+  if (hasCredentials) {
+    // Remove existing credentials and add new ones
+    const urlWithoutCreds = rtspUrl.replace(/^rtsp:\/\/[^@]+@/, 'rtsp://');
+    return urlWithoutCreds.replace('rtsp://', `rtsp://${encodedUsername}:${encodedPassword}@`);
+  } else {
+    // Insert credentials after rtsp://
+    return rtspUrl.replace('rtsp://', `rtsp://${encodedUsername}:${encodedPassword}@`);
+  }
 }
 
 /**
  * Record RTSP stream using FFmpeg
  */
 function recordStream(rtspUrl, outputDir, options = {}) {
-  const { segmentTime = 3600, prefix = 'recording' } = options;
+  const defaultSegmentTime = getSegmentSeconds();
+  const { segmentTime = defaultSegmentTime, prefix = 'recording' } = options;
 
   // Ensure output directory exists
   if (!fs.existsSync(outputDir)) {
@@ -171,14 +328,28 @@ function recordStream(rtspUrl, outputDir, options = {}) {
   console.log(`⏱️  Segment duration: ${segmentTime} seconds`);
   console.log(`🔗 RTSP URL: ${rtspUrl.replace(/:[^:@]+@/, ':****@')}`); // Hide password
 
+  // Debug: show full URL if DEBUG env var is set
+  if (process.env.DEBUG) {
+    console.log(`🔧 DEBUG - Full RTSP URL: ${rtspUrl}`);
+  }
+
+  // Setup S3 upload if configured
+  const s3Config = getS3Config();
+  let stopS3Watcher = null;
+  if (s3Config) {
+    stopS3Watcher = watchAndUploadSegments(outputDir, s3Config, prefix);
+  }
+
   const ffmpegArgs = [
     '-rtsp_transport', 'tcp',
+    '-rtsp_flags', 'prefer_tcp',
     '-i', rtspUrl,
     '-c:v', 'copy',
     '-c:a', 'aac',
     '-f', 'segment',
     '-segment_time', String(segmentTime),
     '-segment_format', 'mp4',
+    '-segment_format_options', 'movflags=+faststart+frag_keyframe+empty_moov',
     '-reset_timestamps', '1',
     '-strftime', '0',
     outputPattern,
@@ -192,10 +363,26 @@ function recordStream(rtspUrl, outputDir, options = {}) {
 
   ffmpeg.stderr.on('data', (data) => {
     const message = data.toString();
-    // Only log important messages, not frame progress
+    // Log important messages and connection info
     if (message.includes('Error') || message.includes('error') ||
-      message.includes('Opening') || message.includes('Stream')) {
-      console.log(message.trim());
+      message.includes('Opening') || message.includes('Stream') ||
+      message.includes('Input') || message.includes('Output') ||
+      message.includes('Duration') || message.includes('Video:') ||
+      message.includes('Audio:') || message.includes('frame=')) {
+      // For frame progress, only show occasionally
+      if (message.includes('frame=')) {
+        // Only log every few seconds (frame updates are too frequent)
+        if (!recordStream.lastFrameLog || Date.now() - recordStream.lastFrameLog > 10000) {
+          recordStream.lastFrameLog = Date.now();
+          const frameMatch = message.match(/frame=\s*(\d+)/);
+          const timeMatch = message.match(/time=(\d+:\d+:\d+\.\d+)/);
+          if (frameMatch && timeMatch) {
+            console.log(`📹 Recording: frame ${frameMatch[1]}, time ${timeMatch[1]}`);
+          }
+        }
+      } else {
+        console.log(message.trim());
+      }
     }
   });
 
@@ -205,6 +392,9 @@ function recordStream(rtspUrl, outputDir, options = {}) {
   });
 
   ffmpeg.on('close', (code) => {
+    if (stopS3Watcher) {
+      stopS3Watcher();
+    }
     if (code === 0) {
       console.log('✅ Recording finished successfully');
     } else {
@@ -242,7 +432,7 @@ program
   .option('--channel-id <channelId>', 'Channel ID', '0')
   .option('--stream-id <streamId>', 'Stream ID (0=main, 1=sub)', '0')
   .option('-o, --output <directory>', 'Output directory', './recordings')
-  .option('-s, --segment-time <seconds>', 'Segment duration in seconds', '3600')
+  .option('-s, --segment-time <seconds>', 'Segment duration in seconds (or set SEGMENT_SECONDS env var)', String(getSegmentSeconds()))
   .action(async (options) => {
     try {
       const appId = options.appId || process.env.IMOU_APP_ID;
@@ -300,7 +490,7 @@ program
   .option('--channel <channel>', 'Camera channel', '1')
   .option('--subtype <subtype>', 'Stream subtype (0=main, 1=sub)', '0')
   .option('-o, --output <directory>', 'Output directory', './recordings')
-  .option('-s, --segment-time <seconds>', 'Segment duration in seconds', '3600')
+  .option('-s, --segment-time <seconds>', 'Segment duration in seconds (or set SEGMENT_SECONDS env var)', String(getSegmentSeconds()))
   .action((options) => {
     const rtspUrl = constructLocalRtspUrl(
       options.ip,
@@ -321,12 +511,34 @@ program
 program
   .command('url')
   .description('Record stream using a direct RTSP URL')
-  .requiredOption('--rtsp <url>', 'Full RTSP URL')
+  .option('--rtsp <url>', 'Full RTSP URL (or set RTSP_URL env var)')
+  .option('--username <username>', 'Camera username (or set RTSP_USERNAME env var, will be URL-encoded)')
+  .option('--password <password>', 'Camera password (or set RTSP_PASSWORD env var, will be URL-encoded)')
   .option('-o, --output <directory>', 'Output directory', './recordings')
-  .option('-s, --segment-time <seconds>', 'Segment duration in seconds', '3600')
+  .option('-s, --segment-time <seconds>', 'Segment duration in seconds (or set SEGMENT_SECONDS env var)', String(getSegmentSeconds()))
   .option('-p, --prefix <prefix>', 'Output file prefix', 'recording')
   .action((options) => {
-    recordStream(options.rtsp, options.output, {
+    // Get RTSP URL from option or env var
+    let rtspUrl = options.rtsp || process.env.RTSP_URL;
+    const username = options.username || process.env.RTSP_USERNAME;
+    const password = options.password || process.env.RTSP_PASSWORD;
+
+    if (!rtspUrl) {
+      console.error('❌ Error: RTSP URL is required.');
+      console.error('   Provide via --rtsp or set RTSP_URL env var');
+      process.exit(1);
+    }
+
+    // If username and password are provided, inject them into the URL
+    if (username && password) {
+      rtspUrl = injectCredentials(rtspUrl, username, password);
+    } else if (username || password) {
+      console.error('❌ Error: Both username and password must be provided together');
+      console.error('   Use --username/--password or RTSP_USERNAME/RTSP_PASSWORD env vars');
+      process.exit(1);
+    }
+
+    recordStream(rtspUrl, options.output, {
       segmentTime: parseInt(options.segmentTime, 10),
       prefix: options.prefix,
     });
