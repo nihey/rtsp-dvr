@@ -264,7 +264,7 @@ function watchAndUploadSegments(outputDir, s3Config, prefix) {
           console.error(`⚠️  Error processing ${filePath}: ${err.message}`);
         }
       }
-    } catch (err) {
+    } catch {
       // Directory might not exist yet
     }
   };
@@ -450,7 +450,7 @@ function injectCredentials(rtspUrl, username, password) {
   const encodedPassword = encodeURIComponent(password);
 
   // Check if URL already has credentials (user:pass@host pattern after rtsp://)
-  const hasCredentials = /^rtsp:\/\/[^\/]+@/.test(rtspUrl);
+  const hasCredentials = /^rtsp:\/\/[^/]+@/.test(rtspUrl);
 
   if (hasCredentials) {
     // Remove existing credentials and add new ones
