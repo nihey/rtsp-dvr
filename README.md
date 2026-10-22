@@ -4,7 +4,7 @@ A Node.js CLI tool to record RTSP streams from IMOU cameras with optional S3-com
 
 ## Prerequisites
 
-- **Node.js** (v18 or higher)
+- **Node.js** (22.23.4 or a newer patched Node 22 release)
 - **FFmpeg** installed and available in your PATH
 
 ### Installing FFmpeg
